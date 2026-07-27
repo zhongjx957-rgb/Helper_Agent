@@ -3,7 +3,7 @@
 
 三路融合策略：
   1. LLM 语义理解（权重 70%）—— 主力，理解复杂语义和上下文
-  2. Embedding 向量相似度（权重 20%）—— 快速匹配常见表达
+  2. N-gram 哈希向量匹配（权重 20%）—— 零依赖，纯 Python 向量兜底
   3. 关键词模式匹配（权重 10%）—— 零延迟兜底
 
 三路结果通过加权投票合并，置信度低于阈值时降级为 OTHER。
@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -68,7 +69,7 @@ _TEMPLATES: Dict[IntentCategory, List[str]] = {
 
 # 紧急关键词
 _URGENCY_KEYWORDS = {
-    UrgencyLevel.CRITICAL: ["紧急", "emergency", "urgent", "asap", "立刻"],
+    UrgencyLevel.CRITICAL: ["紧急", "emergency", "urgent", "asap", "立刻","我很急"],
     UrgencyLevel.HIGH:     ["今天", "马上", "尽快", "hurry", "now"],
     UrgencyLevel.MEDIUM:   ["这周", "soon", "快点"],
 }
@@ -82,19 +83,38 @@ def _cosine(a: List[float], b: List[float]) -> float:
     return dot / (na * nb) if na and nb else 0.0
 
 
+def _ngram_hash_vector(text: str, dims: int = 256) -> List[float]:
+    """稳定的字符 n-gram 哈希向量，用于无远端 Embedding 时的语义近似匹配。"""
+    normalized = text.lower().strip()
+    vec = [0.0] * dims
+    tokens = set()
+    for n in (1, 2, 3):
+        if len(normalized) >= n:
+            tokens.update(normalized[i:i + n] for i in range(len(normalized) - n + 1))
+    if not tokens:
+        tokens.add(normalized)
+
+    for token in tokens:
+        digest = hashlib.md5(token.encode("utf-8")).digest()
+        idx = int.from_bytes(digest[:4], "big") % dims
+        sign = 1.0 if digest[4] % 2 == 0 else -1.0
+        vec[idx] += sign
+    return vec
+
+
 class IntentRecognizer:
     """
     端到端意图识别器。
 
     初始化时不加载任何本地模型，所有 AI 能力通过 Anthropic API 调用。
-    模板 Embedding 在首次请求时懒加载并缓存，后续复用。
+    模板 Embedding 使用本地 n-gram 哈希向量，在首次请求时懒加载并缓存，后续复用。
     """
 
     def __init__(
         self,
         api_key: str,
         base_url: Optional[str] = None,
-        model: str = "claude-3-5-sonnet-20241022",
+        model: str = "deepseek-v4-flash",
         confidence_threshold: float = 0.5,
     ):
         kwargs: Dict[str, Any] = {"api_key": api_key}
@@ -103,12 +123,9 @@ class IntentRecognizer:
         self.client    = AsyncAnthropic(**kwargs)
         self.model     = model
         self.threshold = confidence_threshold
-        # 第三方兼容 API（如 DeepSeek）通常不支持 Embedding，禁用该策略。
-        # 官方 Anthropic SDK 当前没有 embeddings 资源，因此下面会使用稳定的
-        # 本地字符 n-gram 向量作为轻量兜底，保证三路融合链路真实可跑。
-        self._embedding_enabled = not bool(base_url)
+        self._embedding_enabled = True
 
-        self._tpl_embeddings: Dict[IntentCategory, List[List[float]]] = {}
+        self._tpl_vectors: Dict[IntentCategory, List[List[float]]] = {}
         self._cache: Dict[str, IntentResult] = {}
         self.cache_hits   = 0
         self.cache_misses = 0
@@ -133,7 +150,7 @@ class IntentRecognizer:
 
         t0 = time.monotonic()
 
-        # LLM 和 Embedding 并行（Embedding 不可用时跳过）
+        # LLM 和 Embedding 并行
         llm_task = asyncio.create_task(self._llm_recognize(message, history))
         emb_task = asyncio.create_task(self._embedding_recognize(message)) if self._embedding_enabled else None
         pat      = self._pattern_recognize(message)
@@ -144,13 +161,13 @@ class IntentRecognizer:
             llm = await llm_task
             emb = {"intent": IntentCategory.OTHER, "confidence": 0.0}
 
-        intent = self._vote(llm, emb, pat)
+        intent, confidence = self._vote(llm, emb, pat)
         entities = await self._extract_entities(message)
         urgency  = self._urgency(message, intent)
 
         result = IntentResult(
             intent=intent,
-            confidence=llm["confidence"],
+            confidence=confidence,
             urgency=urgency,
             entities=entities,
             reasoning=llm.get("reasoning", ""),
@@ -165,11 +182,11 @@ class IntentRecognizer:
         return result
 
     def learn(self, message: str, correct: IntentCategory) -> None:
-        """在线学习：将纠正样本加入模板，清除对应 Embedding 缓存。"""
+        """在线学习：将纠正样本加入模板，清除对应缓存向量。"""
         tpls = _TEMPLATES.setdefault(correct, [])
         if message not in tpls:
             tpls.append(message)
-            self._tpl_embeddings.pop(correct, None)  # 下次重新计算
+            self._tpl_vectors.pop(correct, None)  # 下次重新计算
             logger.info(f"学习新样本 → {correct.value}: {message[:40]}")
 
     # ── 三路识别策略 ──────────────────────────────────────────────────────────
@@ -216,7 +233,8 @@ class IntentRecognizer:
                 temperature=0.1,
                 messages=[{"role": "user", "content": prompt}],
             )
-            raw = resp.content[0].text
+            text_block = next((b for b in resp.content if getattr(b, "type", "") == "text"), None)
+            raw = text_block.text if text_block else ""
             s, e = raw.find("{"), raw.rfind("}") + 1
             data = json.loads(raw[s:e])
             try:
@@ -229,13 +247,13 @@ class IntentRecognizer:
             return {"intent": IntentCategory.OTHER, "confidence": 0.0, "reasoning": "LLM 失败", "failed": True}
 
     async def _embedding_recognize(self, message: str) -> Dict[str, Any]:
-        """策略 2：Embedding 向量相似度匹配。"""
+        """策略 2：N-gram 哈希向量相似度匹配（纯 Python，零依赖）。"""
         try:
-            await self._load_template_embeddings()
-            msg_vec = await self._embed_text(message)
+            self._load_template_vectors()
+            msg_vec = _ngram_hash_vector(message)
 
             best_cat, best_score = IntentCategory.OTHER, 0.0
-            for cat, vecs in self._tpl_embeddings.items():
+            for cat, vecs in self._tpl_vectors.items():
                 score = max(_cosine(msg_vec, v) for v in vecs)
                 if score > best_score:
                     best_score, best_cat = score, cat
@@ -269,27 +287,33 @@ class IntentRecognizer:
 
     # ── 投票合并 ──────────────────────────────────────────────────────────────
 
-    def _vote(self, llm: Dict, emb: Dict, pat: Dict) -> IntentCategory:
-        """加权投票。embedding 不可用时权重自动转移到 LLM 和 Pattern。"""
-        if llm.get("failed"):
-            if emb.get("intent") != IntentCategory.OTHER and emb.get("confidence", 0.0) > 0:
-                return emb["intent"]
-            if pat.get("intent") != IntentCategory.OTHER and pat.get("confidence", 0.0) > 0:
-                return pat["intent"]
-            return IntentCategory.OTHER
+    def _vote(self, llm: Dict, emb: Dict, pat: Dict) -> tuple[IntentCategory, float]:
+        """加权投票。返回 (意图, 加权置信度)。
 
-        if self._embedding_enabled:
-            weights = [(llm, 0.7), (emb, 0.2), (pat, 0.1)]
-        else:
-            weights = [(llm, 0.85), (pat, 0.15)]
+        只有真正命中的路由才参与加权，权重归一化，避免空路由稀释 LLM 结果。
+        """
+        if llm.get("failed"):
+            for fallback in [emb, pat]:
+                if fallback.get("intent") != IntentCategory.OTHER and fallback.get("confidence", 0.0) > 0:
+                    return fallback["intent"], fallback["confidence"]
+            return IntentCategory.OTHER, 0.0
+
+        entries = [(llm, 0.7)]
+        if self._embedding_enabled and emb.get("intent") != IntentCategory.OTHER:
+            entries.append((emb, 0.2))
+        if pat.get("intent") != IntentCategory.OTHER:
+            entries.append((pat, 0.1))
+
+        total_w = sum(w for _, w in entries)
         scores: Dict[IntentCategory, float] = {}
-        for result, w in weights:
+        for result, w in entries:
             cat  = result.get("intent", IntentCategory.OTHER)
             conf = result.get("confidence", 0.0)
-            scores[cat] = scores.get(cat, 0.0) + w * conf
+            scores[cat] = scores.get(cat, 0.0) + (w / total_w) * conf
 
         best = max(scores, key=scores.get)  # type: ignore
-        return best if scores[best] >= self.threshold else IntentCategory.OTHER
+        weighted_conf = scores[best]
+        return (best, weighted_conf) if weighted_conf >= self.threshold else (IntentCategory.OTHER, weighted_conf)
 
     # ── 实体提取 ──────────────────────────────────────────────────────────────
 
@@ -297,8 +321,8 @@ class IntentRecognizer:
         """用 LLM 从消息中提取结构化实体。"""
         message = self._clean_text(message)
         prompt = f"""从客服消息中提取实体，返回 JSON（字段值为列表，没有则为空列表）:
-消息: "{message}"
-格式: {{"order_id":[],"product":[],"date":[],"amount":[],"error_code":[]}}"""
+        消息: "{message}"
+        格式: {{"order_id":[],"product":[],"date":[],"amount":[],"error_code":[]}}"""
         prompt = self._clean_text(prompt)
         try:
             resp = await self.client.messages.create(
@@ -313,56 +337,13 @@ class IntentRecognizer:
 
     # ── 辅助 ──────────────────────────────────────────────────────────────────
 
-    async def _load_template_embeddings(self) -> None:
-        """懒加载所有模板的 Embedding（只在首次调用时执行）。"""
-        missing = [cat for cat in _TEMPLATES if cat not in self._tpl_embeddings]
+    def _load_template_vectors(self) -> None:
+        """懒加载所有模板的 n-gram 哈希向量（同步，极快）。"""
+        missing = [cat for cat in _TEMPLATES if cat not in self._tpl_vectors]
         if not missing:
             return
-
-        all_texts = [t for cat in missing for t in _TEMPLATES[cat]]
-        vecs = [await self._embed_text(text) for text in all_texts]
-        idx = 0
         for cat in missing:
-            n = len(_TEMPLATES[cat])
-            self._tpl_embeddings[cat] = vecs[idx: idx + n]
-            idx += n
-
-    async def _embed_text(self, text: str) -> List[float]:
-        """
-        生成文本向量。
-
-        如果未来接入的官方/兼容客户端提供 embeddings.create，会优先使用远端向量；
-        当前 Anthropic SDK 没有该资源时，退化为字符 n-gram 哈希向量。这样不会因为
-        Embedding 服务缺失导致三路融合中断。
-        """
-        embeddings = getattr(self.client, "embeddings", None)
-        if embeddings is not None:
-            try:
-                resp = await embeddings.create(model="voyage-3-lite", input=[text])
-                return list(resp.data[0].embedding)
-            except Exception as ex:
-                logger.warning(f"远端 Embedding 失败，使用本地向量兜底: {ex}")
-
-        return self._local_embedding(text)
-
-    @staticmethod
-    def _local_embedding(text: str, dims: int = 256) -> List[float]:
-        """稳定的字符 n-gram 哈希向量，用于无远端 Embedding 时的语义近似匹配。"""
-        normalized = text.lower().strip()
-        vec = [0.0] * dims
-        tokens = set()
-        for n in (1, 2, 3):
-            if len(normalized) >= n:
-                tokens.update(normalized[i:i + n] for i in range(len(normalized) - n + 1))
-        if not tokens:
-            tokens.add(normalized)
-
-        for token in tokens:
-            digest = hashlib.md5(token.encode("utf-8")).digest()
-            idx = int.from_bytes(digest[:4], "big") % dims
-            sign = 1.0 if digest[4] % 2 == 0 else -1.0
-            vec[idx] += sign
-        return vec
+            self._tpl_vectors[cat] = [_ngram_hash_vector(t) for t in _TEMPLATES[cat]]
 
     def _urgency(self, message: str, intent: IntentCategory) -> UrgencyLevel:
         msg = message.lower()

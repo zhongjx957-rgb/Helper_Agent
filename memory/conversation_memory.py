@@ -101,7 +101,12 @@ class MemoryManager:
 
         # ChromaDB：优先连接独立服务（docker compose 模式），连不上则降级为本地嵌入式
         try:
-            chroma = chromadb.HttpClient(host=chroma_host, port=chroma_port)
+            # HttpClient 默认也会初始化 ChromaDB telemetry；显式关闭避免 posthog 兼容性错误日志。
+            chroma = chromadb.HttpClient(
+                host=chroma_host,
+                port=chroma_port,
+                settings=chromadb.Settings(anonymized_telemetry=False),
+            )
             chroma.heartbeat()  # 测试连接
             logger.info(f"ChromaDB 已连接: {chroma_host}:{chroma_port}")
         except Exception:
@@ -162,10 +167,8 @@ class MemoryManager:
 
         text = self._safe_text("\n".join(f"{m.role.value}: {m.content}" for m in messages[-10:]))
         prompt = f"""从以下对话中提炼用户偏好和关键实体，返回 JSON。
-对话:
-{text}
-
-返回格式: {{"preferences": ["..."], "entities": {{"产品": [], "问题类型": []}}}}"""
+        对话:{text}
+        返回格式: {{"preferences": ["..."], "entities": {{"产品": [], "问题类型": []}}}}"""
         prompt = self._safe_text(prompt)
 
         try:
@@ -173,7 +176,8 @@ class MemoryManager:
                 model=self._model, max_tokens=512, temperature=0.0,
                 messages=[{"role": "user", "content": prompt}],
             )
-            raw = resp.content[0].text
+            text_block = next((b for b in resp.content if getattr(b, "type", "") == "text"), None)
+            raw = text_block.text if text_block else ""
             s, e = raw.find("{"), raw.rfind("}") + 1
             profile_data = json.loads(raw[s:e])
 
@@ -252,7 +256,9 @@ class MemoryManager:
                 model=self._model, max_tokens=256, temperature=0.0,
                 messages=[{"role": "user", "content": prompt}],
             )
-            summary = self._safe_text(resp.content[0].text).strip()
+            text_block = next((b for b in resp.content if getattr(b, "type", "") in ("text", "thinking")), None)
+            raw = text_block.text if text_block and text_block.text else (text_block.thinking if text_block and hasattr(text_block, "thinking") and text_block.thinking else "")
+            summary = self._safe_text(raw).strip()
         except Exception:
             summary = f"对话包含 {len(to_compress)} 条消息（摘要生成失败）"
 

@@ -13,11 +13,22 @@ ChromaDB 在这里的角色：
 """
 import hashlib
 import logging
-from typing import Any, Dict, List, Optional
+import os
+from enum import Enum
+from typing import Any, Dict, List, Optional, Tuple
 
 import chromadb
+import jieba
+import numpy as np
+from rank_bm25 import BM25Okapi
 
 logger = logging.getLogger(__name__)
+
+
+class FusionStrategy(str, Enum):
+    """混合检索融合策略。"""
+    RRF = "rrf"               # Reciprocal Rank Fusion
+    WEIGHTED = "weighted"     # 加权平均融合
 
 
 class KnowledgeBase:
@@ -40,7 +51,12 @@ class KnowledgeBase:
         # 优先连接独立 ChromaDB 服务（服务端内置 embedding 模型，客户端无需下载）
         self._use_server = False
         try:
-            self._client = chromadb.HttpClient(host=chroma_host, port=chroma_port)
+            # HttpClient 默认也会初始化 ChromaDB telemetry；显式关闭避免 posthog 兼容性错误日志。
+            self._client = chromadb.HttpClient(
+                host=chroma_host,
+                port=chroma_port,
+                settings=chromadb.Settings(anonymized_telemetry=False),
+            )
             self._client.heartbeat()
             self._use_server = True
             logger.info(f"知识库 ChromaDB 已连接: {chroma_host}:{chroma_port}")
@@ -61,6 +77,25 @@ class KnowledgeBase:
         # 如果知识库为空，导入默认文档
         if self._collection.count() == 0:
             self._load_default_docs()
+
+        # ── BM25 关键词检索 相关属性 ──────────────────────────────────────────
+        self._bm25_built: bool = False
+        self._bm25_index: Optional[BM25Okapi] = None
+        self._bm25_corpus: List[str] = []
+        self._bm25_tokenized: List[List[str]] = []
+        self._bm25_doc_ids: List[str] = []
+        self._bm25_config: Dict[str, Any] = {
+            "k1": 1.5,       # 词频饱和参数
+            "b": 0.75,       # 长度归一化参数
+        }
+        # 自定义词典路径（可选，通过环境变量配置）
+        _user_dict = os.getenv("JIEBA_USER_DICT", "")
+        if _user_dict:
+            jieba.load_userdict(_user_dict)
+            logger.info(f"jieba 已加载自定义词典: {_user_dict}")
+
+        # 自动构建 BM25 索引
+        self._init_bm25_index()
 
     # ── 文档管理 ──────────────────────────────────────────────────────────────
 
@@ -88,6 +123,8 @@ class KnowledgeBase:
             # ChromaDB 会自动生成 Embedding
             self._collection.add(ids=ids, documents=docs, metadatas=metas)
             logger.info(f"知识库导入 {len(ids)} 个文档片段")
+            # 重建 BM25 索引以包含新文档
+            self._rebuild_bm25_index()
 
         return len(ids)
 
@@ -104,16 +141,18 @@ class KnowledgeBase:
 
         items = []
         if results["documents"] and results["documents"][0]:
-            for doc, meta, dist in zip(
+            for doc, meta, dist, doc_id in zip(
                 results["documents"][0],
                 results["metadatas"][0],
                 results["distances"][0],
+                results["ids"][0],
             ):
                 items.append({
                     "title":    meta.get("title", ""),
                     "content":  doc,
                     "score":    round(1.0 - dist, 4),  # ChromaDB 返回距离，转为相似度
                     "chunk":    meta.get("chunk_index", 0),
+                    "_id":      doc_id,  # ChromaDB ID，供混合检索对齐使用
                 })
 
         return items
@@ -121,6 +160,288 @@ class KnowledgeBase:
     @property
     def doc_count(self) -> int:
         return self._collection.count()
+
+    # ── BM25 索引管理 ─────────────────────────────────────────────────────────
+
+    def _init_bm25_index(self) -> None:
+        """
+        从 ChromaDB 全量读取文档块，用 jieba 分词后构建 BM25Okapi 倒排索引。
+        在初始化时自动调用。
+        """
+        try:
+            all_docs = self._collection.get()
+            if not all_docs or not all_docs.get("documents"):
+                self._bm25_built = True  # 空知识库也算就绪
+                logger.info("BM25 索引: 知识库为空，跳过索引构建")
+                return
+
+            documents = all_docs["documents"]
+            doc_ids = all_docs.get("ids", [])
+            if not documents:
+                self._bm25_built = True
+                return
+
+            # 分词
+            tokenized = [list(jieba.lcut_for_search(doc)) for doc in documents]
+
+            self._bm25_corpus = list(documents)
+            self._bm25_tokenized = tokenized
+            self._bm25_doc_ids = list(doc_ids)
+
+            # 重建 BM25 索引
+            self._bm25_index = BM25Okapi(
+                tokenized,
+                k1=self._bm25_config["k1"],
+                b=self._bm25_config["b"],
+            )
+            self._bm25_built = True
+            logger.info(f"BM25 索引构建完成: {len(self._bm25_corpus)} 个文档块, "
+                        f"k1={self._bm25_config['k1']}, b={self._bm25_config['b']}")
+        except Exception as ex:
+            self._bm25_built = False
+            logger.error(f"BM25 索引构建失败: {ex}")
+
+    def _bm25_search(self, query: str) -> List[Tuple[int, float]]:
+        """
+        BM25 关键词检索。
+
+        Args:
+            query: 用户查询字符串
+
+        Returns:
+            List[(corpus_index, bm25_score)] — 按 BM25 得分降序排列
+        """
+        if not self._bm25_built or self._bm25_index is None:
+            return []
+
+        query_tokens = list(jieba.lcut_for_search(query))
+        scores = self._bm25_index.get_scores(query_tokens)
+
+        # 按得分降序排列
+        ranked = sorted(
+            enumerate(scores),
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        # 过滤掉得分为 0 的结果
+        ranked = [(idx, score) for idx, score in ranked if score > 0]
+        return ranked
+
+    def _rebuild_bm25_index(self) -> None:
+        """从当前 ChromaDB 全量重建 BM25 索引（用于文档增删后同步）。"""
+        self._init_bm25_index()
+
+    # ── 融合策略 ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _rrf_fuse(
+        bm25_rankings: List[Tuple[int, float]],
+        vector_rankings: List[Tuple[int, float]],
+        top_k: int,
+        k: int = 60,
+    ) -> List[Tuple[int, float]]:
+        """
+        Reciprocal Rank Fusion (RRF) 融合。
+        将两路排位列表按 RRF 公式融合：
+            RRF_score(d) = 1/(k + rank_bm25(d)) + 1/(k + rank_vector(d))
+
+        Args:
+            bm25_rankings:    BM25 排名列表 [(idx, score), ...] 按得分降序
+            vector_rankings:  向量排名列表 [(idx, score), ...] 按得分降序
+            top_k:            返回 Top-K
+            k:                RRF 平滑常数（默认 60）
+
+        Returns:
+            List[(doc_index, fusion_score)] — 按融合得分降序
+        """
+        rrf_scores: Dict[int, float] = {}
+
+        # BM25 贡献
+        for rank_pos, (doc_idx, _) in enumerate(bm25_rankings):
+            rrf_scores[doc_idx] = rrf_scores.get(doc_idx, 0.0) + 1.0 / (k + rank_pos + 1)
+
+        # 向量贡献
+        for rank_pos, (doc_idx, _) in enumerate(vector_rankings):
+            rrf_scores[doc_idx] = rrf_scores.get(doc_idx, 0.0) + 1.0 / (k + rank_pos + 1)
+
+        # 按融合分降序排列
+        sorted_scores = sorted(
+            rrf_scores.items(),
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        return sorted_scores[:top_k]
+
+    @staticmethod
+    def _weighted_fuse(
+        bm25_rankings: List[Tuple[int, float]],
+        vector_rankings: List[Tuple[int, float]],
+        top_k: int,
+        alpha: float = 0.5,
+    ) -> List[Tuple[int, float]]:
+        """
+        加权平均融合。将两路得分归一化到 [0,1] 后加权求和。
+        公式: fusion = alpha * vector_norm + (1-alpha) * bm25_norm
+
+        Args:
+            bm25_rankings:    BM25 排名 [(idx, score), ...]
+            vector_rankings:  向量排名 [(idx, score), ...]
+            top_k:            返回 Top-K
+            alpha:            向量权重（0-1），BM25 权重为 1-alpha
+
+        Returns:
+            List[(doc_index, fusion_score)] — 按融合得分降序
+        """
+        # 构建 {doc_idx: score} 映射
+        bm25_map = {idx: score for idx, score in bm25_rankings}
+        vector_map = {idx: score for idx, score in vector_rankings}
+
+        # 收集所有涉及的文档索引
+        all_indices = set(bm25_map.keys()) | set(vector_map.keys())
+
+        def _min_max_norm(scores_map: Dict[int, float]) -> Dict[int, float]:
+            """Min-Max 归一化到 [0, 1]"""
+            if not scores_map:
+                return {}
+            values = list(scores_map.values())
+            min_v, max_v = min(values), max(values)
+            if max_v == min_v:
+                return {k: 0.5 for k in scores_map}
+            return {k: (v - min_v) / (max_v - min_v) for k, v in scores_map.items()}
+
+        bm25_norm = _min_max_norm(bm25_map)
+        vector_norm = _min_max_norm(vector_map)
+
+        fused = {}
+        for idx in all_indices:
+            b_score = bm25_norm.get(idx, 0.0)
+            v_score = vector_norm.get(idx, 0.0)
+            fused[idx] = alpha * v_score + (1.0 - alpha) * b_score
+
+        sorted_scores = sorted(
+            fused.items(),
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        return sorted_scores[:top_k]
+
+    # ── 混合检索 ───────────────────────────────────────────────────────────────
+
+    def hybrid_search(
+        self,
+        query: str,
+        top_k: int = 5,
+        strategy: str = "rrf",
+        rrf_k: int = 60,
+        alpha: float = 0.5,
+    ) -> List[Dict[str, Any]]:
+        """
+        混合检索：BM25 关键词检索 + ChromaDB 向量检索 → RRF/加权融合。
+
+        Args:
+            query:    用户查询
+            top_k:    返回 Top-K 结果
+            strategy: 融合策略 "rrf" | "weighted"
+            rrf_k:    RRF 平滑常数
+            alpha:    加权融合中向量的权重（0-1）
+
+        Returns:
+            结果列表，每项包含 title, content, bm25_score, vector_score,
+            fusion_score, chunk, source
+        """
+        if not self._bm25_built:
+            logger.warning("BM25 索引未就绪，回退到纯向量检索")
+            return self.search(query, top_k=top_k)
+
+        # 1. BM25 检索
+        bm25_rankings = self._bm25_search(query)
+
+        # 2. 向量检索（多取一些候选，供融合排序使用）
+        recall_k = max(top_k * 2, 10)
+        vector_results = self.search(query, top_k=recall_k)
+        if self._bm25_doc_ids:
+            vector_rankings = []
+            for item in vector_results:
+                doc_id = item.get("_id", "")
+                if doc_id in self._bm25_doc_ids:
+                    corpus_idx = self._bm25_doc_ids.index(doc_id)
+                    vector_rankings.append((corpus_idx, item.get("score", 0.0)))
+        else:
+            vector_rankings = [
+                (i, item.get("score", 0.0))
+                for i, item in enumerate(vector_results)
+            ]
+
+        # 3. 融合
+        if strategy == FusionStrategy.WEIGHTED:
+            fused = self._weighted_fuse(bm25_rankings, vector_rankings, top_k, alpha=alpha)
+        else:
+            fused = self._rrf_fuse(bm25_rankings, vector_rankings, top_k, k=rrf_k)
+
+        # 4. 组装结果
+        result_map = {}
+        for idx, score in bm25_rankings:
+            if idx < len(self._bm25_corpus):
+                result_map[idx] = {
+                    "content": self._bm25_corpus[idx],
+                    "bm25_score": round(score, 4),
+                    "vector_score": 0.0,
+                }
+        for idx, score in vector_rankings:
+            if idx < len(self._bm25_corpus):
+                if idx in result_map:
+                    result_map[idx]["vector_score"] = round(score, 4)
+                else:
+                    result_map[idx] = {
+                        "content": self._bm25_corpus[idx] if idx < len(self._bm25_corpus) else "",
+                        "bm25_score": 0.0,
+                        "vector_score": round(score, 4),
+                    }
+
+        items = []
+        for idx, f_score in fused:
+            if idx not in result_map:
+                continue
+            info = result_map[idx]
+            # 尝试从 ChromaDB metadata 取 title
+            title = ""
+            if self._bm25_doc_ids and idx < len(self._bm25_doc_ids):
+                try:
+                    meta_result = self._collection.get(
+                        ids=[self._bm25_doc_ids[idx]],
+                        include=["metadatas"],
+                    )
+                    if meta_result and meta_result.get("metadatas") and meta_result["metadatas"][0]:
+                        title = meta_result["metadatas"][0].get("title", "")
+                except Exception:
+                    pass
+
+            items.append({
+                "title":    title,
+                "content":  info["content"],
+                "bm25_score":  info["bm25_score"],
+                "vector_score": info["vector_score"],
+                "fusion_score": round(f_score, 4),
+                "source":   "hybrid",
+            })
+
+        # 若融合结果不足，用向量检索结果补足
+        if len(items) < top_k:
+            existing_ids = {item.get("content", "") for item in items}
+            for v_item in vector_results:
+                if v_item.get("content", "") not in existing_ids:
+                    v_item["source"] = "hybrid"
+                    v_item["bm25_score"] = 0.0
+                    v_item["vector_score"] = v_item.get("score", 0.0)
+                    v_item["fusion_score"] = v_item.get("score", 0.0)
+                    items.append(v_item)
+                    existing_ids.add(v_item.get("content", ""))
+                if len(items) >= top_k:
+                    break
+
+        logger.debug(f"混合检索: query={query!r}, strategy={strategy}, "
+                      f"结果数={len(items)}")
+        return items[:top_k]
 
     # ── MCP 工具 handler ─────────────────────────────────────────────────────
 
@@ -136,29 +457,112 @@ class KnowledgeBase:
         """
         query = params.get("query", "")
         top_k = params.get("top_k", 5)
+        hybrid = params.get("hybrid", False)
+        if hybrid:
+            return self.hybrid_search(
+                query=query,
+                top_k=top_k,
+                strategy=params.get("strategy", "rrf"),
+                rrf_k=params.get("rrf_k", 60),
+                alpha=params.get("alpha", 0.5),
+            )
         return self.search(query, top_k=top_k)
 
     # ── 内部方法 ──────────────────────────────────────────────────────────────
 
-    def _chunk_text(self, text: str, chunk_size: int = 500) -> List[str]:
-        """将长文本按 chunk_size 切片，保留语义完整性（按句号/换行切分）。"""
+    def _chunk_text(self, text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
+        """
+        段落感知的分层切分策略：
+
+        1. 先按空行切分为段落
+        2. 段落长度 ≤ chunk_size → 完整保留为一个 chunk
+        3. 段落长度 > chunk_size → 在该段落内按句子切分（递归降级）
+        4. 相邻短段落合并（合并后总长不超过 chunk_size 时合并，减少碎片）
+
+        Args:
+            text:     原始文本
+            chunk_size: 每片最大字符数（默认 500）
+            overlap:    相邻 chunk 的重叠字符数（默认 50）
+
+        Returns:
+            分片后的文本列表
+        """
         if len(text) <= chunk_size:
             return [text] if text.strip() else []
 
+        import re
+
+        # ── 1. 按空行切分为段落 ──
+        paragraphs = re.split(r'\n{2,}', text)
+        paragraphs = [p.strip() for p in paragraphs if p.strip()]
+        if not paragraphs:
+            return []
+
+        # ── 2. 处理每个段落 ──
+        processed = []
+        for para in paragraphs:
+            if len(para) <= chunk_size:
+                # 段落没超限 → 完整保留
+                processed.append(para)
+            else:
+                # 超长段落 → 段落内按句子切分
+                para_chunks = self._chunk_by_sentences(para, chunk_size, overlap)
+                processed.extend(para_chunks)
+
+        # ── 3. 合并相邻短段落（合并后不超 chunk_size 就合并） ──
+        if len(processed) <= 1:
+            return processed
+
+        merged = [processed[0]]
+        for chunk in processed[1:]:
+            if len(merged[-1]) + 1 + len(chunk) <= chunk_size:
+                merged[-1] = f"{merged[-1]}\n\n{chunk}"
+            else:
+                merged.append(chunk)
+
+        return merged
+
+    @staticmethod
+    def _chunk_by_sentences(text: str, chunk_size: int, overlap: int) -> List[str]:
+        """
+        超长段落内的句子级切分（保持原有的句子完整性逻辑）。
+        仅在被 _chunk_text 判定段落超限时调用。
+        """
+        import re
+        sentences = re.split(r'[。！？.!?\n]', text)
+        sentences = [s.strip() for s in sentences if s.strip()]
+        if not sentences:
+            return [text]
+
         chunks = []
         current = ""
-        # 按句子切分
-        sentences = text.replace("\n", "。").split("。")
+        overlap_pool = []  # 最近几句，用于为新 chunk 构建 overlap 前缀
+
         for sent in sentences:
-            sent = sent.strip()
-            if not sent:
-                continue
-            if len(current) + len(sent) + 1 > chunk_size:
+            candidate = f"{current}。{sent}" if current else sent
+
+            if len(candidate) > chunk_size:
                 if current:
                     chunks.append(current)
-                current = sent
+
+                # 从 overlap_pool 尾部提取不超过 overlap 字符的尾句
+                prefix = ""
+                chars = 0
+                for s in reversed(overlap_pool):
+                    cost = len(s) + 1  # 句子本身 + 句号
+                    if chars + cost > overlap:
+                        break
+                    prefix = f"{s}。{prefix}" if prefix else s
+                    chars += cost
+
+                current = f"{prefix}。{sent}" if prefix else sent
             else:
-                current = f"{current}。{sent}" if current else sent
+                current = candidate
+
+            overlap_pool.append(sent)
+            total = sum(len(s) for s in overlap_pool)
+            while total > chunk_size and len(overlap_pool) > 1:
+                total -= len(overlap_pool.pop(0))
 
         if current:
             chunks.append(current)

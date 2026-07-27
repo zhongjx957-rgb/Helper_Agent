@@ -32,6 +32,8 @@ logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+# 屏蔽 ChromaDB telemetry 的噪音日志
+logging.getLogger("chromadb.telemetry.product.posthog").setLevel(logging.CRITICAL)
 logger = logging.getLogger(__name__)
 
 BANNER = r"""
@@ -49,6 +51,7 @@ _memory       = None
 _tool_manager = None
 _monitor      = None
 _evaluator    = None
+_skill_manager = None
 
 
 def _anthropic_cfg() -> Dict[str, Any]:
@@ -67,7 +70,7 @@ def _anthropic_cfg() -> Dict[str, Any]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator
+    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager
 
     print(BANNER, flush=True)
 
@@ -78,6 +81,7 @@ async def lifespan(app: FastAPI):
     from mcp.tool_manager import MCPToolManager, Tool
     from memory.conversation_memory import MemoryManager
     from monitor.performance_monitor import PerformanceMonitor
+    from core.skill_loader import SkillManager
 
     cfg = _anthropic_cfg()
     logger.info(f"模型: {cfg['model']}  base_url: {cfg.get('base_url', '(官方)')}")
@@ -89,11 +93,20 @@ async def lifespan(app: FastAPI):
         model=cfg["model"],
     )
 
+    # Skills：启动时从目录加载业务能力说明，并在 Agent 调用 LLM 时动态注入。
+    skills_dir = os.getenv("ECHOMIND_SKILLS_DIR", str(pathlib.Path(_ROOT) / "skills"))
+    _skill_manager = SkillManager(
+        root_dir=skills_dir,
+        max_prompt_chars=int(os.getenv("ECHOMIND_SKILLS_MAX_PROMPT_CHARS", "5000")),
+    )
+    _skill_manager.load()
+
     # Agent 编排器
     _orchestrator = AgentOrchestrator(
         api_key=cfg["api_key"],
         base_url=cfg.get("base_url"),
         model=cfg["model"],
+        skill_manager=_skill_manager,
     )
 
     # 记忆管理器（Redis 工作记忆 + ChromaDB 情景记忆/用户画像）
@@ -132,13 +145,17 @@ async def lifespan(app: FastAPI):
 
     _tool_manager.register(Tool(
         name="knowledge_search",
-        description="搜索知识库（基于 ChromaDB 向量检索）",
+        description="搜索知识库，支持混合检索（BM25+向量RRF融合）",
         handler=kb.search_handler,
         schema={
             "type": "object",
             "properties": {
-                "query": {"type": "string"},
-                "top_k": {"type": "integer"},
+                "query":    {"type": "string",  "description": "搜索查询"},
+                "top_k":    {"type": "integer", "description": "返回Top-K结果", "default": 5},
+                "hybrid":   {"type": "boolean", "description": "启用混合检索（BM25+向量RRF融合）", "default": False},
+                "strategy": {"type": "string",  "description": "融合策略: rrf / weighted", "default": "rrf"},
+                "rrf_k":    {"type": "integer", "description": "RRF平滑常数", "default": 60},
+                "alpha":    {"type": "number",  "description": "加权融合中向量的权重", "default": 0.5},
             },
             "required": ["query"],
         },
@@ -216,6 +233,25 @@ async def health():
     return {"status": "ok", "agents": _orchestrator.get_stats()}
 
 
+@app.get("/skills", tags=["Skills"])
+async def skills_summary():
+    """查看当前已加载的 Skills，便于确认热加载结果和排查解析错误。"""
+    if _skill_manager is None:
+        raise HTTPException(503, "Skills 未初始化")
+    return _skill_manager.summary()
+
+
+@app.post("/skills/reload", tags=["Skills"])
+async def reload_skills():
+    """运行时重新扫描 Skill 目录，不需要重启服务。"""
+    if _skill_manager is None:
+        raise HTTPException(503, "Skills 未初始化")
+    _skill_manager.reload()
+    if _orchestrator is not None:
+        _orchestrator.set_skill_manager(_skill_manager)
+    return _skill_manager.summary()
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
     """
@@ -285,7 +321,10 @@ async def _build_knowledge_context(message: str, top_k: int = 3) -> tuple[str, b
     if not _should_use_knowledge(message):
         return "", False
     try:
-        result = await _tool_manager.search_with_rewrite("knowledge_search", message, top_k=top_k)
+        result = await _tool_manager.search_with_rewrite(
+            "knowledge_search", message, top_k=top_k,
+            hybrid=True, strategy="rrf",
+        )
         if not result.success or not isinstance(result.data, list) or not result.data:
             return "", False
 
@@ -342,15 +381,31 @@ async def prometheus_metrics():
 
 
 @app.post("/search")
-async def search(query: str, top_k: int = 5):
+async def search(
+    query: str,
+    top_k: int = 5,
+    hybrid: bool = True,
+    strategy: str = "rrf",
+    rrf_k: int = 60,
+    alpha: float = 0.5,
+):
     """
     演示检索优化链路：查询改写 → 并行召回 → 重排 → Top-K。
-    展示 MCP 工具调用的核心亮点。
+    支持混合检索（BM25+向量RRF融合）。
     """
     if _tool_manager is None:
         raise HTTPException(503, "服务未就绪")
-    result = await _tool_manager.search_with_rewrite("knowledge_search", query, top_k=top_k)
-    return {"query": query, "results": result.data, "reranked": result.reranked}
+    result = await _tool_manager.search_with_rewrite(
+        "knowledge_search", query, top_k=top_k,
+        hybrid=hybrid, strategy=strategy,
+    )
+    return {
+        "query": query,
+        "results": result.data,
+        "reranked": result.reranked,
+        "hybrid": hybrid,
+        "strategy": strategy,
+    }
 
 
 class DocInput(BaseModel):
@@ -461,7 +516,12 @@ async def knowledge_stats():
     if tool is None:
         raise HTTPException(503, "知识库未初始化")
     kb = tool.handler.__self__
-    return {"total_chunks": kb.doc_count}
+    stats = {"total_chunks": kb.doc_count}
+    if hasattr(kb, "_bm25_built"):
+        stats["bm25_index_built"] = kb._bm25_built
+        stats["bm25_corpus_size"] = len(getattr(kb, "_bm25_corpus", []))
+        stats["bm25_config"] = getattr(kb, "_bm25_config", {})
+    return stats
 
 
 @app.post("/eval/run")
@@ -522,9 +582,20 @@ async def _cli():
 
     from agents.agent_orchestrator import AgentOrchestrator, Request
     from memory.conversation_memory import MemoryManager, MsgRole
+    from core.skill_loader import SkillManager
 
     cfg = _anthropic_cfg()
-    orch = AgentOrchestrator(api_key=cfg["api_key"], base_url=cfg.get("base_url"), model=cfg["model"])
+    skill_manager = SkillManager(
+        root_dir=os.getenv("ECHOMIND_SKILLS_DIR", str(pathlib.Path(_ROOT) / "skills")),
+        max_prompt_chars=int(os.getenv("ECHOMIND_SKILLS_MAX_PROMPT_CHARS", "5000")),
+    )
+    skill_manager.load()
+    orch = AgentOrchestrator(
+        api_key=cfg["api_key"],
+        base_url=cfg.get("base_url"),
+        model=cfg["model"],
+        skill_manager=skill_manager,
+    )
     mem  = MemoryManager(
         redis_url=os.getenv("REDIS_URL", "redis://localhost:6379/0"),
         chroma_host=os.getenv("CHROMA_HOST", "localhost"),

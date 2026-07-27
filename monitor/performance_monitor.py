@@ -114,7 +114,7 @@ class PerformanceMonitor:
     THRESHOLDS = {
         "agent_success_rate":  (0.90, Severity.ERROR,   "less_than"),
         "tool_success_rate":   (0.95, Severity.WARNING,  "less_than"),
-        "agent_avg_ms":        (3000, Severity.WARNING,  "greater_than"),
+        "agent_avg_ms":        (8000, Severity.WARNING,  "greater_than"),
         "tool_avg_ms":         (5000, Severity.ERROR,    "greater_than"),
     }
 
@@ -256,10 +256,14 @@ class PerformanceMonitor:
         threshold, severity, operator = self.THRESHOLDS[metric]
         triggered = (operator == "less_than" and value < threshold) or \
                     (operator == "greater_than" and value > threshold)
+        metric_key = f"{metric}:{label}"
         if triggered:
+            # 去重：同一指标已有未解决的告警则不重复添加
+            if any(a.metric == metric_key and not a.resolved for a in self._alerts):
+                return
             alert = Alert(
                 severity=severity,
-                metric=f"{metric}:{label}",
+                metric=metric_key,
                 message=f"{label} 的 {metric} = {value:.3f}，阈值 {threshold}",
                 value=value,
                 threshold=threshold,
@@ -269,6 +273,12 @@ class PerformanceMonitor:
             # 异步发送 Webhook（不阻塞采集循环）
             if self._webhook:
                 asyncio.create_task(self._send_webhook(alert))
+        else:
+            # 指标已恢复 → 自动标记对应告警为 resolved
+            for alert in self._alerts:
+                if alert.metric == metric_key and not alert.resolved:
+                    alert.resolved = True
+                    logger.info(f"[RESOLVED] {alert.message}")
 
     def _generate_routing_suggestions(self, agent_stats: Dict[str, Any]) -> None:
         """

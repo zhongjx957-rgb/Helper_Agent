@@ -246,6 +246,71 @@ class MCPToolManager:
             logger.error(f"工具降级失败: {tool.name} — {ex}")
             return ToolResult(success=False, data=None, tool_name=tool.name, error=f"{error}; fallback失败: {ex}")
 
+    # ── 通用：从 LLM 响应提取文本（兼容不同 API 格式）───────────────────────
+
+    @staticmethod
+    def _extract_text(resp) -> str:
+        """
+        从 Anthropic SDK 的 messages.create 响应中提取文本内容。
+        兼容不同 API（Anthropic 官方 / DeepSeek / 其他兼容接口）的响应格式差异。
+        """
+        # Anthropic 官方格式：resp.content 是 ContentBlock 列表
+        if hasattr(resp, "content"):
+            content = resp.content
+            # ContentBlock 列表
+            if isinstance(content, list):
+                # 第一遍：优先提取 text 类型（真正的答案）
+                for block in content:
+                    block_type = getattr(block, "type", None) or (block.get("type") if isinstance(block, dict) else None)
+                    if block_type == "text":
+                        if isinstance(block, dict):
+                            text = block.get("text", "")
+                            if text:
+                                return str(text)
+                        elif hasattr(block, "text") and block.text:
+                            return block.text
+                # 第二遍：回落 thinking 类型（DeepSeek 兼容接口）
+                for block in content:
+                    block_type = getattr(block, "type", None) or (block.get("type") if isinstance(block, dict) else None)
+                    if block_type == "thinking":
+                        if isinstance(block, dict):
+                            text = block.get("thinking", "")
+                            if text:
+                                return str(text)
+                        elif hasattr(block, "thinking") and block.thinking:
+                            return str(block.thinking)
+                # 第三遍：兜底——只要是有值的内容块
+                for block in content:
+                    if isinstance(block, dict):
+                        text = block.get("text") or block.get("content") or ""
+                        if text:
+                            return str(text)
+                    elif hasattr(block, "text") and block.text:
+                        return block.text
+                    elif hasattr(block, "thinking") and block.thinking:
+                        return str(block.thinking)
+            # 字符串
+            elif isinstance(content, str):
+                return content
+            # 单 block
+            if hasattr(content, "text") and content.text:
+                return content.text
+
+        # DeepSeek / OpenAI 兼容格式：resp.choices[0].message.content
+        if hasattr(resp, "choices"):
+            try:
+                text = resp.choices[0].message.content
+                if text:
+                    return str(text)
+            except (IndexError, AttributeError):
+                pass
+
+        # 直接是字符串
+        if isinstance(resp, str):
+            return resp
+
+        return ""
+
     # ── 查询改写（解决召回不全）────────────────────────────────────────────────
 
     async def rewrite_query(self, query: str, n: int = 3) -> List[str]:
@@ -260,16 +325,19 @@ class MCPToolManager:
           改写: ["如何申请退款", "退款需要多少天", "退款政策是什么"]
         """
         prompt = f"""将以下用户查询改写为 {n} 个不同角度的搜索子查询，用于检索知识库。
-要求：每个子查询角度不同，覆盖原始问题的不同方面。
-原始查询: "{query}"
-返回 JSON 数组，例如: ["子查询1", "子查询2", "子查询3"]"""
+                要求：每个子查询角度不同，覆盖原始问题的不同方面。
+                原始查询: "{query}"
+                返回 JSON 数组，例如: ["如何申请退款", "退款需要多少天", "退款政策是什么"]"""
         prompt = self._clean_text(prompt)
         try:
             resp = await self._client.messages.create(
                 model=self._model, max_tokens=256, temperature=0.3,
+                system="请直接输出结果，不要输出思考过程。",
                 messages=[{"role": "user", "content": prompt}],
             )
-            raw = resp.content[0].text
+            raw = self._extract_text(resp)
+            if not raw:
+                raise ValueError("响应中无文本内容")
             s, e = raw.find("["), raw.rfind("]") + 1
             queries = json.loads(raw[s:e])
             # 原始查询也保留，去重
@@ -284,11 +352,13 @@ class MCPToolManager:
         query: str,
         top_k: int = 5,
         context: Optional[Dict[str, Any]] = None,
+        hybrid: bool = True,
+        strategy: str = "rrf",
     ) -> ToolResult:
         """
         完整的检索优化链路：查询改写 → 并行召回 → 去重 → 重排 → Top-K
 
-        这是解决"检索不全、召回不好"的完整方案。
+        支持混合检索：传递 hybrid=True 启用 BM25 + 向量融合。
         """
         # 1. 查询改写：生成多角度子查询
         sub_queries = await self.rewrite_query(query, n=3)
@@ -297,7 +367,12 @@ class MCPToolManager:
         # 2. 并行召回：所有子查询同时检索
         recall_k = max(top_k, 5)
         tasks = [
-            self.call(tool_name, {"query": q, "top_k": recall_k}, context, use_cache=True)
+            self.call(tool_name, {
+                "query": q,
+                "top_k": recall_k,
+                "hybrid": hybrid,
+                "strategy": strategy,
+            }, context, use_cache=True)
             for q in sub_queries
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -335,21 +410,35 @@ class MCPToolManager:
         items_text = "\n".join(f"{i}. {json.dumps(item, ensure_ascii=False)[:200]}"
                                for i, item in enumerate(items))
         prompt = f"""根据用户查询，对以下检索结果按相关性打分（0-10），返回 JSON 数组。
-用户查询: "{query}"
-检索结果:
-{items_text}
+        用户查询: "{query}"
+        检索结果:
+        {items_text}
 
-返回格式（按相关性降序排列的索引列表）: [最相关的索引, ..., 最不相关的索引]
-只返回 JSON 数组，不要其他文字。"""
+        返回格式（按相关性降序排列的索引列表）: [最相关的索引, ..., 最不相关的索引]
+        只返回 JSON 数组，不要其他文字。"""
         prompt = self._clean_text(prompt)
 
         try:
             resp = await self._client.messages.create(
-                model=self._model, max_tokens=256, temperature=0.0,
+                model=self._model, max_tokens=1024, temperature=0.3,
+                system="请直接输出结果，不要输出思考过程。",
                 messages=[{"role": "user", "content": prompt}],
             )
-            raw = resp.content[0].text
-            s, e = raw.find("["), raw.rfind("]") + 1
+            raw = self._extract_text(resp)
+            if not raw:
+                raise ValueError("响应中无文本内容")
+            # 尝试从 markdown 代码块中提取 JSON
+            if "```" in raw:
+                for line in raw.splitlines():
+                    stripped = line.strip()
+                    if stripped.startswith("["):
+                        raw = stripped
+                        break
+            s = raw.find("[")
+            if s == -1:
+                logger.warning("重排响应中未找到 JSON 数组，原始响应: %s", raw[:300])
+                raise ValueError("响应中未找到 JSON 数组")
+            e = raw.rfind("]") + 1
             order: List[int] = json.loads(raw[s:e])
             reranked = [items[i] for i in order if 0 <= i < len(items)]
             return reranked[:top_k]

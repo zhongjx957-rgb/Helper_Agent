@@ -102,9 +102,10 @@ class BaseAgent:
     agent_type: AgentType
     system_prompt: str
 
-    def __init__(self, client: AsyncAnthropic, model: str):
+    def __init__(self, client: AsyncAnthropic, model: str, skill_manager: Optional[Any] = None):
         self._client = client
         self._model  = model
+        self._skill_manager = skill_manager
         self.stats   = AgentStats()
 
     async def handle(self, req: Request) -> AgentResponse:
@@ -146,11 +147,21 @@ class BaseAgent:
 
         resp = await self._client.messages.create(
             model=self._model,
-            max_tokens=1024,
-            system=self.system_prompt,
+            max_tokens=4096,
+            system=self._build_system_prompt(req),
             messages=messages,
         )
-        return resp.content[0].text
+        text_block = next((b for b in resp.content if getattr(b, "type", "") == "text"), None)
+        return text_block.text if text_block else ""
+
+    def _build_system_prompt(self, req: Request) -> str:
+        """把动态加载的 Skills 拼入 system prompt，让业务规则随请求生效。"""
+        if self._skill_manager is None:
+            return self.system_prompt
+        skill_prompt = self._skill_manager.prompt_for(req.message, self.agent_type.value)
+        if not skill_prompt:
+            return self.system_prompt
+        return f"{self.system_prompt}\n\n[动态 Skills]\n{skill_prompt}"
 
     def _needs_escalation(self, content: str) -> bool:
         """检测 Agent 是否建议升级（简单关键词检测）。"""
@@ -161,24 +172,36 @@ class BaseAgent:
 class GeneralAgent(BaseAgent):
     agent_type    = AgentType.GENERAL
     system_prompt = (
-        "你是 EchoMind 智能客服。友好、简洁地回答用户问题。"
-        "如果问题超出你的能力范围，明确说明并建议转接专业客服。"
+        "你是 EchoMind 智能客服。请遵循以下原则：\n"
+        "1. 完整解决：针对用户的每一个问题点，给出完整、详尽的解决方案，不要过早结束回答。\n"
+        "2. 具体操作：提供可执行的具体步骤，而不是抽象描述。例如「打开设置 → 点击账户 → 选择修改密码」而非「请修改密码」。\n"
+        "3. 结构清晰：用编号或分段组织回答，确保用户能按指引操作。\n"
+        "4. 覆盖所有子问题：如果用户有多个疑问，逐一回答，不要遗漏。\n"
+        "如果问题超出你的能力范围，明确说明原因并建议转接专业客服。"
     )
 
 
 class TechnicalAgent(BaseAgent):
     agent_type    = AgentType.TECHNICAL
     system_prompt = (
-        "你是技术支持专家。专注于：故障排查、错误诊断、系统配置。"
-        "提供清晰的步骤化解决方案。遇到需要后台操作的问题，说明需要升级处理。"
+        "你是技术支持专家。请遵循以下原则：\n"
+        "1. 步骤化排障：从最常见原因到罕见原因，逐步排查，每一步给出具体操作指令。\n"
+        "2. 完整覆盖：不仅要告诉用户「检查网络」，还要告诉他怎么检查、检查到什么结果代表什么含义。\n"
+        "3. 预期结果：每个步骤后说明用户应该看到什么（截图指标、日志关键词等）。\n"
+        "4. 兜底方案：如果几步后仍未解决，给出明确的后续路径（如联系后台、提交工单）。\n"
+        "遇到需要后台操作的问题，说明需要升级处理。"
     )
 
 
 class BillingAgent(BaseAgent):
     agent_type    = AgentType.BILLING
     system_prompt = (
-        "你是账单服务专家。专注于：账单查询、退款申请、发票问题、订阅管理。"
-        "对财务问题保持准确和专业。涉及实际退款操作时，说明需要人工审核。"
+        "你是账单服务专家。请遵循以下原则：\n"
+        "1. 具体可操作：告知用户能自己操作的完整路径，例如「登录官网 → 我的账户 → 账单中心 → 申请退款」。\n"
+        "2. 解释原因：先解释可能的原因（如扣款周期、系统延迟），再给出解决方案。\n"
+        "3. 时间预期：说明每个处理步骤的预计时间（如「退款审核 1-3 个工作日到账」）。\n"
+        "4. 覆盖备选：如果用户的方案不可行，主动提供替代方案。\n"
+        "涉及实际扣款/退款操作时，说明需要人工审核的环节。"
     )
 
 
@@ -199,8 +222,9 @@ class AgentOrchestrator:
         IntentCategory.TECHNICAL:  AgentType.TECHNICAL,
         IntentCategory.BILLING:    AgentType.BILLING,
         IntentCategory.ACCOUNT:    AgentType.BILLING,
+        IntentCategory.REQUEST:    AgentType.BILLING,
         IntentCategory.ESCALATION: AgentType.ESCALATION,
-        # 其余意图 → GENERAL（默认）
+        # 其余意图（QUERY / COMPLAINT / GREETING / FEEDBACK / OTHER）→ GENERAL（默认）
     }
 
     def __init__(
@@ -208,6 +232,7 @@ class AgentOrchestrator:
         api_key:  str,
         base_url: Optional[str] = None,
         model:    str = "claude-3-5-sonnet-20241022",
+        skill_manager: Optional[Any] = None,
     ):
         kwargs: Dict[str, Any] = {"api_key": api_key}
         if base_url:
@@ -215,13 +240,21 @@ class AgentOrchestrator:
         client = AsyncAnthropic(**kwargs)
 
         self._intent_recognizer = IntentRecognizer(api_key=api_key, base_url=base_url, model=model)
+        self._skill_manager = skill_manager
 
         # Agent 池：每种类型可有多个实例（水平扩展）
         self._pool: Dict[AgentType, List[BaseAgent]] = {
-            AgentType.GENERAL:   [GeneralAgent(client, model)],
-            AgentType.TECHNICAL: [TechnicalAgent(client, model)],
-            AgentType.BILLING:   [BillingAgent(client, model)],
+            AgentType.GENERAL:   [GeneralAgent(client, model, skill_manager)],
+            AgentType.TECHNICAL: [TechnicalAgent(client, model, skill_manager)],
+            AgentType.BILLING:   [BillingAgent(client, model, skill_manager)],
         }
+
+    def set_skill_manager(self, skill_manager: Optional[Any]) -> None:
+        """更新 SkillManager 引用，供运行时重载或测试替换使用。"""
+        self._skill_manager = skill_manager
+        for agents in self._pool.values():
+            for agent in agents:
+                agent._skill_manager = skill_manager
 
     # ── 主入口 ────────────────────────────────────────────────────────────────
 
