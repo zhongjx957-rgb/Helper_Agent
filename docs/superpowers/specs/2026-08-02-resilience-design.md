@@ -57,6 +57,7 @@ core/resilience.py
   协程对象只能 await 一次。
 - **`call_with_timeout` 与 `with_retry` 组合**：`with_retry(lambda: call_with_timeout(...))`，
   超时被归类为瞬态错误参与重试。
+- **`attempts` 语义**：总尝试次数（含首次调用）。默认 `attempts=3` = 首次 + 2 次重试。
 
 ## 重试规则：只重试瞬态错误
 
