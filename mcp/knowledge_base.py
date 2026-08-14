@@ -457,7 +457,8 @@ class KnowledgeBase:
         """
         query = params.get("query", "")
         top_k = params.get("top_k", 5)
-        hybrid = params.get("hybrid", False)
+        # 默认走混合检索（与工具 schema 的 default=True 保持一致）
+        hybrid = params.get("hybrid", True)
         if hybrid:
             return self.hybrid_search(
                 query=query,

@@ -152,7 +152,7 @@ async def lifespan(app: FastAPI):
             "properties": {
                 "query":    {"type": "string",  "description": "搜索查询"},
                 "top_k":    {"type": "integer", "description": "返回Top-K结果", "default": 5},
-                "hybrid":   {"type": "boolean", "description": "启用混合检索（BM25+向量RRF融合）", "default": False},
+                "hybrid":   {"type": "boolean", "description": "启用混合检索（BM25+向量RRF融合）", "default": True},
                 "strategy": {"type": "string",  "description": "融合策略: rrf / weighted", "default": "rrf"},
                 "rrf_k":    {"type": "integer", "description": "RRF平滑常数", "default": 60},
                 "alpha":    {"type": "number",  "description": "加权融合中向量的权重", "default": 0.5},

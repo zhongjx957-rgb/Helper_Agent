@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional
 from anthropic import AsyncAnthropic
 
 from core.intent_recognizer import IntentCategory, IntentRecognizer, UrgencyLevel
+from core.resilience import REQUEST_TOTAL_TIMEOUT, with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -145,11 +146,14 @@ class BaseAgent:
             messages.append({"role": "assistant", "content": "好的，我已了解背景信息。"})
         messages.append({"role": "user", "content": _clean(req.message)})
 
-        resp = await self._client.messages.create(
-            model=self._model,
-            max_tokens=4096,
-            system=self._build_system_prompt(req),
-            messages=messages,
+        # 外包 with_retry（超时 + 重试）：ResilienceError 由 handle() 的 except 捕获，走失败降级
+        resp = await with_retry(
+            lambda: self._client.messages.create(
+                model=self._model,
+                max_tokens=4096,
+                system=self._build_system_prompt(req),
+                messages=messages,
+            )
         )
         text_block = next((b for b in resp.content if getattr(b, "type", "") == "text"), None)
         return text_block.text if text_block else ""
@@ -260,7 +264,29 @@ class AgentOrchestrator:
 
     async def run(self, req: Request) -> OrchestratorResult:
         """
-        处理一次请求的完整流程：
+        处理一次请求的完整流程（链路级超时兜底）。
+
+        单次 LLM 调用已有 with_retry 的超时；这里在整条链路上再包一层
+        REQUEST_TOTAL_TIMEOUT，防止"意图识别 + 多 Agent 并行 + 工具调用"叠加超时。
+        """
+        try:
+            return await asyncio.wait_for(self._run(req), timeout=REQUEST_TOTAL_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.error(f"请求 {req.request_id} 整链路超时（>{REQUEST_TOTAL_TIMEOUT}s）")
+            return OrchestratorResult(
+                request_id=req.request_id,
+                response="抱歉，处理超时，请稍后重试。",
+                agent_type=AgentType.GENERAL,
+                intent=req.intent,
+                escalated=True,
+                latency_ms=REQUEST_TOTAL_TIMEOUT * 1000,
+            )
+        except asyncio.CancelledError:
+            raise
+
+    async def _run(self, req: Request) -> OrchestratorResult:
+        """
+        实际处理流程（不含链路超时包装）：
           意图识别 → 路由选 Agent → 执行 → 检查升级 → 返回结果
         """
         t0 = time.monotonic()

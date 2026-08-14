@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional
 from anthropic import AsyncAnthropic
 
 from core.intent_recognizer import IntentCategory, IntentRecognizer
+from core.resilience import with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -122,9 +123,12 @@ class LLMJudge:
         )
         prompt = self._clean_text(prompt)
         try:
-            resp = await self._client.messages.create(
-                model=self._model, max_tokens=256, temperature=0.0,
-                messages=[{"role": "user", "content": prompt}],
+            # 外包 with_retry：失败已有降级（judge_failed=True 回退 0.5 分）
+            resp = await with_retry(
+                lambda: self._client.messages.create(
+                    model=self._model, max_tokens=256, temperature=0.0,
+                    messages=[{"role": "user", "content": prompt}],
+                )
             )
             text_block = next((b for b in resp.content if getattr(b, "type", "") == "text"), None)
             raw = text_block.text if text_block else ""

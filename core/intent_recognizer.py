@@ -21,6 +21,8 @@ from typing import Any, Dict, List, Optional
 
 from anthropic import AsyncAnthropic
 
+from core.resilience import with_retry
+
 logger = logging.getLogger(__name__)
 
 
@@ -213,25 +215,27 @@ class IntentRecognizer:
             )
 
         prompt = f"""你是客服意图分析专家。根据示例判断用户意图，返回 JSON。
+        示例:
+        {examples}
+        {ctx}
+        用户消息: "{message}"
 
-示例:
-{examples}
+        返回格式（仅 JSON，不要其他文字）:
+        {{"intent": "<意图值>", "confidence": <0-1>, "reasoning": "<一句话说明>"}}
 
-{ctx}
-用户消息: "{message}"
-
-返回格式（仅 JSON，不要其他文字）:
-{{"intent": "<意图值>", "confidence": <0-1>, "reasoning": "<一句话说明>"}}
-
-可选意图: {", ".join(c.value for c in IntentCategory)}"""
+        可选意图: {", ".join(c.value for c in IntentCategory)}"""
         prompt = self._clean_text(prompt)
 
         try:
-            resp = await self.client.messages.create(
-                model=self.model,
-                max_tokens=256,
-                temperature=0.1,
-                messages=[{"role": "user", "content": prompt}],
+            # 外包 with_retry：重试耗尽抛 ResilienceError → 被下方 except 捕获，返回 failed，
+            # 由 embedding / pattern 兜底接管意图识别
+            resp = await with_retry(
+                lambda: self.client.messages.create(
+                    model=self.model,
+                    max_tokens=256,
+                    temperature=0.1,
+                    messages=[{"role": "user", "content": prompt}],
+                )
             )
             text_block = next((b for b in resp.content if getattr(b, "type", "") == "text"), None)
             raw = text_block.text if text_block else ""
@@ -325,9 +329,12 @@ class IntentRecognizer:
         格式: {{"order_id":[],"product":[],"date":[],"amount":[],"error_code":[]}}"""
         prompt = self._clean_text(prompt)
         try:
-            resp = await self.client.messages.create(
-                model=self.model, max_tokens=256, temperature=0.0,
-                messages=[{"role": "user", "content": prompt}],
+            # 外包 with_retry：失败返回空实体字典（现状语义不变）
+            resp = await with_retry(
+                lambda: self.client.messages.create(
+                    model=self.model, max_tokens=256, temperature=0.0,
+                    messages=[{"role": "user", "content": prompt}],
+                )
             )
             raw = resp.content[0].text
             s, e = raw.find("{"), raw.rfind("}") + 1

@@ -23,6 +23,8 @@ from typing import Any, Callable, Dict, List, Optional
 
 from anthropic import AsyncAnthropic
 
+from core.resilience import with_retry
+
 logger = logging.getLogger(__name__)
 
 
@@ -53,6 +55,7 @@ class ToolStats:
     failed:             int = 0
     total_latency_ms:   float = 0.0
     consecutive_fails:  int = 0
+    retried:            int = 0   # 重试次数（with_retry 的 on_failure 累加）
 
     @property
     def success_rate(self) -> float:
@@ -187,7 +190,14 @@ class MCPToolManager:
             # 参数校验（根据 JSON Schema 的 required 和 properties.type）
             self._validate_params(tool, params)
 
-            data = await asyncio.wait_for(tool.handler(params, context), timeout=tool.timeout_s)
+            # with_retry：把超时（tool.timeout_s）+ 重试内聚在一起；
+            # on_failure 每次失败都喂给熔断器 + 累计 retried 计数，
+            # 重试耗尽后再由下方 except 补记一次，确保持续失败必然触发 OPEN。
+            data = await with_retry(
+                lambda: tool.handler(params, context),
+                timeout=tool.timeout_s,
+                on_failure=lambda ex, attempt: self._record_retry_failure(tool, ex, attempt),
+            )
             latency = (time.monotonic() - t0) * 1000
 
             tool.stats.success += 1
@@ -208,19 +218,23 @@ class MCPToolManager:
             return ToolResult(success=True, data=data, tool_name=name,
                               latency_ms=latency, reranked=reranked)
 
-        except asyncio.TimeoutError:
-            tool.stats.failed += 1
-            tool.stats.consecutive_fails += 1
-            tool.breaker.record_failure()
-            logger.error(f"工具超时: {name} ({tool.timeout_s}s)")
-            return await self._fallback_result(tool, params, context, "执行超时")
-
+        # 超时已内聚进 with_retry（耗尽后抛 ResilienceError），这里统一按异常处理降级
         except Exception as ex:
             tool.stats.failed += 1
             tool.stats.consecutive_fails += 1
             tool.breaker.record_failure()
             logger.error(f"工具异常: {name} — {ex}")
             return await self._fallback_result(tool, params, context, str(ex))
+
+    @staticmethod
+    def _record_retry_failure(tool: Tool, ex: Exception, attempt: int) -> None:
+        """重试期每次失败喂给熔断器并累计 retried 计数（重试喂养熔断器的衔接点）。
+
+        让"重试仍然失败"能持续累积 fail_count，最终触发 CircuitBreaker OPEN，
+        而不是因为重试掩盖了故障导致熔断器误以为下游一直健康。
+        """
+        tool.breaker.record_failure()
+        tool.stats.retried += 1
 
     async def _fallback_result(
         self,
@@ -330,10 +344,13 @@ class MCPToolManager:
                 返回 JSON 数组，例如: ["如何申请退款", "退款需要多少天", "退款政策是什么"]"""
         prompt = self._clean_text(prompt)
         try:
-            resp = await self._client.messages.create(
-                model=self._model, max_tokens=256, temperature=0.3,
-                system="请直接输出结果，不要输出思考过程。",
-                messages=[{"role": "user", "content": prompt}],
+            # 外包 with_retry：失败已有降级（使用原始查询）
+            resp = await with_retry(
+                lambda: self._client.messages.create(
+                    model=self._model, max_tokens=256, temperature=0.3,
+                    system="请直接输出结果，不要输出思考过程。",
+                    messages=[{"role": "user", "content": prompt}],
+                )
             )
             raw = self._extract_text(resp)
             if not raw:
@@ -419,10 +436,13 @@ class MCPToolManager:
         prompt = self._clean_text(prompt)
 
         try:
-            resp = await self._client.messages.create(
-                model=self._model, max_tokens=1024, temperature=0.3,
-                system="请直接输出结果，不要输出思考过程。",
-                messages=[{"role": "user", "content": prompt}],
+            # 外包 with_retry：失败已有降级（返回原始顺序）
+            resp = await with_retry(
+                lambda: self._client.messages.create(
+                    model=self._model, max_tokens=1024, temperature=0.3,
+                    system="请直接输出结果，不要输出思考过程。",
+                    messages=[{"role": "user", "content": prompt}],
+                )
             )
             raw = self._extract_text(resp)
             if not raw:
@@ -508,6 +528,7 @@ class MCPToolManager:
                 "success_rate": round(t.stats.success_rate, 3),
                 "avg_latency_ms": round(t.stats.avg_latency_ms, 1),
                 "consecutive_fails": t.stats.consecutive_fails,
+                "retried": t.stats.retried,
                 "circuit_state": t.breaker.state.value,
             }
             for name, t in self._tools.items()
