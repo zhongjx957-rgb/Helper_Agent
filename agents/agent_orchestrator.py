@@ -176,7 +176,7 @@ class BaseAgent:
 class GeneralAgent(BaseAgent):
     agent_type    = AgentType.GENERAL
     system_prompt = (
-        "你是 EchoMind 智能客服。请遵循以下原则：\n"
+        "你是 We_Listen 智能客服。请遵循以下原则：\n"
         "1. 完整解决：针对用户的每一个问题点，给出完整、详尽的解决方案，不要过早结束回答。\n"
         "2. 具体操作：提供可执行的具体步骤，而不是抽象描述。例如「打开设置 → 点击账户 → 选择修改密码」而非「请修改密码」。\n"
         "3. 结构清晰：用编号或分段组织回答，确保用户能按指引操作。\n"

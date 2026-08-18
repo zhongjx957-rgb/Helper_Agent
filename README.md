@@ -1,8 +1,8 @@
-# EchoMind 智能客服系统
+# We_Listen 智能客服系统
 
 ```
 ʕ•ᴥ•ʔ  ʕ•ᴥ•ʔ  ʕ•ᴥ•ʔ
-   EchoMind  v2.0
+   We_Listen  v2.0
    智能客服 AI 系统
 ʕ•ᴥ•ʔ  ʕ•ᴥ•ʔ  ʕ•ᴥ•ʔ
 ```
@@ -117,7 +117,7 @@ ANTHROPIC_MODEL=deepseek-v4-flash
 
 # Redis（工作记忆）
 REDIS_URL=redis://localhost:6379/0
-REDIS_PASSWORD=echomind123
+REDIS_PASSWORD=we_listen123
 
 # ChromaDB（情景记忆 + 用户画像 + 知识库）
 CHROMA_HOST=localhost
@@ -125,8 +125,8 @@ CHROMA_PORT=8001
 CHROMA_PERSIST_DIRECTORY=./data/chroma
 
 # Skills
-ECHOMIND_SKILLS_DIR=./skills
-ECHOMIND_SKILLS_MAX_PROMPT_CHARS=5000
+WE_LISTEN_SKILLS_DIR=./skills
+WE_LISTEN_SKILLS_MAX_PROMPT_CHARS=5000
 
 # 监控 / 评测
 PROMETHEUS_PORT=9091
@@ -140,7 +140,7 @@ EVAL_BASELINE_PATH=./data/eval/baseline.json
 - `redis`：Redis 7，工作记忆，宿主端口 `6379`
 - `chromadb`：ChromaDB 0.5.23，向量库，宿主端口 `8001`
 - `prometheus`：Prometheus 指标采集，宿主端口 `9090`
-- `echomind`：EchoMind FastAPI 服务，宿主端口 `8000`
+- `we_listen`：We_Listen FastAPI 服务，宿主端口 `8000`
 - `nginx`：Nginx 反向代理，宿主端口 `80`
 
 ```bash
