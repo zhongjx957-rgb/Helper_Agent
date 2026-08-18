@@ -1,13 +1,13 @@
 #!/bin/bash
 
-# We_Listen 镜像运行脚本
+# EchoMind 镜像运行脚本
 # 提供多种运行配置选项
 
 set -e
 
 # 配置
-IMAGE_NAME="we_listen"
-CONTAINER_NAME="we_listen-app"
+IMAGE_NAME="echomind"
+CONTAINER_NAME="echomind-app"
 VERSION=${VERSION:-latest}
 REGISTRY=""  # 如果镜像在私有仓库，设置为 registry.example.com/
 
@@ -40,7 +40,7 @@ print_error() {
 
 show_help() {
     cat << EOF
-We_Listen Docker 镜像运行工具
+EchoMind Docker 镜像运行工具
 
 用法: ./run-image.sh [命令] [选项]
 

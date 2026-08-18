@@ -1,4 +1,4 @@
-# We_Listen 弹性工具箱设计（超时 / 重试 / 循环守卫）
+# EchoMind 弹性工具箱设计（超时 / 重试 / 循环守卫）
 
 - 日期：2026-08-02
 - 范围：`core/resilience.py` 及其在 agent / intent / tool / judge 链路的接入
@@ -6,7 +6,7 @@
 
 ## 背景与动机
 
-We_Listen 的故障处理目前只有两块：
+EchoMind 的故障处理目前只有两块：
 
 1. **熔断器（CircuitBreaker）**—— 位于 `mcp/tool_manager.py`，处理"持续故障防雪崩"。
 2. **降级（Fallback）**—— 工具 fallback、Agent 降级到 GeneralAgent、意图识别 embedding/pattern 兜底。
